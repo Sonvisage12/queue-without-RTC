@@ -17,7 +17,6 @@ MFRC522 mfrc522(SS_PIN, RST_PIN);
 Preferences preferences;
 int patientNum;
 
-// Queue item now has a reservation flag and the MAC of the reserving node
 struct QueueItem {
   char uid[20];
   char timestamp[25];
@@ -28,7 +27,7 @@ struct QueueItem {
 };
 
 struct SyncRequest {
-  char type[10]; // should be "SYNC_REQ"
+  char type[10];
 };
 
 std::map<String, QueueItem> queueMap;
@@ -37,20 +36,18 @@ std::queue<String> patientOrder;
 uint8_t patientMAC[] = {0x08, 0xD1, 0xF9, 0xD7, 0x50, 0x98};
 uint8_t patientMAC1[] = {0x30, 0xC6, 0xF7, 0x44, 0x1D, 0x24};
 uint8_t displayMAC[] = {0xA4, 0xCF, 0x12, 0xF1, 0x6B, 0xA5};
-uint8_t StaffMAC2[] = {0x78, 0x42, 0x1C, 0x6C, 0xA8, 0x3C"};
+uint8_t StaffMAC2[] = {0x78, 0x42, 0x1C, 0x6C, 0xA8, 0x3C};
 
-std::vector<uint8_t*> peerMACs = {
-  patientMAC,
-  patientMAC1,
-  StaffMAC2,
-  displayMAC
+std::vector<std::array<uint8_t, 6>> peerMACs = {
+  {0x08, 0xD1, 0xF9, 0xD7, 0x50, 0x98},
+  {0x30, 0xC6, 0xF7, 0x44, 0x1D, 0x24},
+  {0x78, 0x42, 0x1C, 0x6C, 0xA8, 0x3C},
+  {0xA4, 0xCF, 0x12, 0xF1, 0x6B, 0xA5}
 };
 
-// Track local reservation state
 bool hasReserved = false;
 String myReservedUID = "";
 
-// Persist the entire queue (including reservations) to flash
 void persistQueue() {
   preferences.begin("queue", false);
   preferences.clear();
@@ -64,7 +61,6 @@ void persistQueue() {
   preferences.end();
 }
 
-// Load queue (previously saved items) from flash
 void loadQueueFromFlash() {
   preferences.begin("queue", true);
   int size = preferences.getUInt("queueSize", 0);
@@ -81,15 +77,13 @@ void loadQueueFromFlash() {
   Serial.println("🔁 Restored queue from flash.");
 }
 
-// Broadcast a single queue item to all peers via ESP-NOW
 void broadcastQueueItem(const QueueItem& item) {
-  for (auto mac : peerMACs) {
-    esp_now_send(mac, (uint8_t*)&item, sizeof(item));
+  for (auto& mac : peerMACs) {
+    esp_now_send(mac.data(), (uint8_t*)&item, sizeof(item));
     delay(10);
   }
 }
 
-// Broadcast the full queue (all items) to all peers
 void broadcastFullQueue() {
   for (auto& entry : queueMap) {
     broadcastQueueItem(entry.second);
@@ -97,7 +91,6 @@ void broadcastFullQueue() {
   Serial.println("📤 Broadcasted full queue to all peers.");
 }
 
-// Try to reserve the next unreserved patient (in FIFO order)
 void tryReserveNext() {
   if (hasReserved) return;
   std::queue<String> tempQueue = patientOrder;
@@ -107,10 +100,9 @@ void tryReserveNext() {
     if (!queueMap.count(uid)) continue;
     QueueItem &item = queueMap[uid];
     if (!item.reserved) {
-      // Reserve this patient
       item.reserved = true;
       esp_read_mac(item.reservedByMAC, ESP_MAC_WIFI_STA);
-      broadcastQueueItem(item);  // inform peers of reservation
+      broadcastQueueItem(item);
       myReservedUID = uid;
       hasReserved = true;
       Serial.print("🔒 Patient reserved: ");
@@ -122,9 +114,7 @@ void tryReserveNext() {
   }
 }
 
-// Handle incoming ESP-NOW data (sync requests, new patient, reservation, or removal)
-void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-  // Handle sync request
+void onDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
   if (len == sizeof(SyncRequest)) {
     SyncRequest req;
     memcpy(&req, incomingData, sizeof(req));
@@ -135,17 +125,14 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
     }
   }
 
-  // Handle queue item updates (new, reserved, or removal)
   if (len == sizeof(QueueItem)) {
     QueueItem item;
     memcpy(&item, incomingData, sizeof(item));
     String uid = String(item.uid);
 
     if (item.removeFromQueue) {
-      // Patient removed from queue
       if (queueMap.count(uid)) {
         queueMap.erase(uid);
-        // Remove from patientOrder
         std::queue<String> tempQueue;
         while (!patientOrder.empty()) {
           if (patientOrder.front() != uid)
@@ -162,18 +149,15 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
       }
     }
     else if (item.reserved) {
-      // Reservation sync from another node
       if (queueMap.count(uid)) {
         queueMap[uid].reserved = true;
         memcpy(queueMap[uid].reservedByMAC, item.reservedByMAC, 6);
         Serial.print("🔒 Patient reserved by peer: ");
         Serial.println(uid);
       }
-      // No queue modification needed beyond marking reserved
       return;
     }
     else {
-      // New patient added
       if (!queueMap.count(uid)) {
         queueMap[uid] = item;
         patientOrder.push(uid);
@@ -190,6 +174,9 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
     }
   }
 }
+
+// (rest of the code remains unchanged)
+
 
 void setup() {
   Serial.begin(115200);
@@ -216,13 +203,12 @@ void setup() {
   }
   esp_now_register_recv_cb(onDataRecv);
 
-  // Add all known peers for ESP-NOW
-  for (auto mac : peerMACs) {
+  for (auto& mac : peerMACs) {
     esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, mac, 6);
+    memcpy(peerInfo.peer_addr, mac.data(), 6);
     peerInfo.channel = 1;
     peerInfo.encrypt = false;
-    if (!esp_now_is_peer_exist(mac)) {
+    if (!esp_now_is_peer_exist(mac.data())) {
       esp_now_add_peer(&peerInfo);
     }
   }
@@ -230,11 +216,10 @@ void setup() {
   loadQueueFromFlash();
   Serial.println("👨‍⚕️ Doctor Node Initialized");
 
-  // Sync queue state from peers at startup
   SyncRequest req;
   strcpy(req.type, "SYNC_REQ");
-  for (auto mac : peerMACs) {
-    esp_now_send(mac, (uint8_t*)&req, sizeof(req));
+  for (auto& mac : peerMACs) {
+    esp_now_send(mac.data(), (uint8_t*)&req, sizeof(req));
     delay(10);
   }
   Serial.println("🔄 Sync request sent to peers.");
@@ -244,8 +229,6 @@ void setup() {
 
 void loop() {
   if (queueMap.empty() || patientOrder.empty()) return;
-
-  // If not currently holding a reservation, try to reserve next patient
   if (!hasReserved) {
     tryReserveNext();
   }
@@ -257,20 +240,17 @@ void loop() {
   String uid = getUIDString(mfrc522.uid.uidByte, mfrc522.uid.size);
   uid.toUpperCase();
 
-  // Check if scanned card matches our reserved patient
   if (uid == myReservedUID) {
     QueueItem item = queueMap[myReservedUID];
     Serial.print("✅ Patient No ");
     Serial.print(item.number);
     Serial.println(" attended. Removing from queue.");
 
-    // Broadcast removal
     item.removeFromQueue = true;
     broadcastQueueItem(item);
     patientNum = item.number;
     esp_now_send(displayMAC, (uint8_t*)&patientNum, sizeof(patientNum));
 
-    // Remove from our queue and persist
     queueMap.erase(myReservedUID);
     std::queue<String> tempQueue;
     while (!patientOrder.empty()) {
@@ -281,7 +261,6 @@ void loop() {
     patientOrder = tempQueue;
     persistQueue();
 
-    // Clear reservation and move to next
     hasReserved = false;
     myReservedUID = "";
     tryReserveNext();
@@ -298,16 +277,14 @@ void loop() {
   delay(1500);
 }
 
-// Display the first unreserved patient to the external display
 void displayNextPatient() {
-  // Iterate in FIFO order until an unreserved item is found
   std::queue<String> tempQueue = patientOrder;
   while (!tempQueue.empty()) {
     String uid = tempQueue.front();
     tempQueue.pop();
     if (!queueMap.count(uid)) continue;
     QueueItem item = queueMap[uid];
-    if (item.reserved) continue;  // skip those already reserved
+    if (item.reserved) continue;
     broadcastQueueItem(item);
     patientNum = item.number;
     esp_now_send(displayMAC, (uint8_t*)&patientNum, sizeof(patientNum));
@@ -317,7 +294,6 @@ void displayNextPatient() {
   }
   Serial.println("📭 Queue is now empty.");
   patientNum = 0;
-  // Optionally: send patientNum=0 to displayMAC to clear display
 }
 
 String getUIDString(byte *buffer, byte bufferSize) {
